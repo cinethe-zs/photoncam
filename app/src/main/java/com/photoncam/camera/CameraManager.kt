@@ -1,14 +1,18 @@
 package com.photoncam.camera
 
 import android.content.Context
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager as Camera2Manager
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.util.Range
 import android.util.Size
 import android.view.OrientationEventListener
 import android.view.Surface
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import android.hardware.camera2.CaptureRequest
 import androidx.camera.core.Camera
@@ -47,6 +51,12 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.roundToInt
 
+data class CameraParams(
+    val shutterNs: Long,   // SENSOR_EXPOSURE_TIME in nanoseconds
+    val iso: Int,          // SENSOR_SENSITIVITY
+    val aperture: Float,   // LENS_APERTURE  (f-number)
+)
+
 @Singleton
 class CameraManager @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -55,6 +65,12 @@ class CameraManager @Inject constructor(
     private var imageCapture: ImageCapture? = null
     @Volatile private var camera: Camera? = null
     private var cachedProvider: ProcessCameraProvider? = null
+
+    // ── Camera params (shutter / ISO / aperture) ──────────────────────────────
+    private val _cameraParams = MutableStateFlow<CameraParams?>(null)
+    val cameraParams: StateFlow<CameraParams?> = _cameraParams.asStateFlow()
+    @Volatile private var cameraParamsEnabled = false
+    private var lastParamsMs = 0L
 
     // ── Histogram ─────────────────────────────────────────────────────────────
     private val _histogramData = MutableStateFlow<FloatArray?>(null)
@@ -199,7 +215,26 @@ class CameraManager @Inject constructor(
 
                 previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
 
-                val preview = Preview.Builder().build()
+                val previewBuilder = Preview.Builder()
+                Camera2Interop.Extender(previewBuilder).setSessionCaptureCallback(
+                    object : CameraCaptureSession.CaptureCallback() {
+                        override fun onCaptureCompleted(
+                            session: CameraCaptureSession,
+                            request: CaptureRequest,
+                            result: TotalCaptureResult,
+                        ) {
+                            if (!cameraParamsEnabled) return
+                            val now = System.currentTimeMillis()
+                            if (now - lastParamsMs < 200L) return
+                            lastParamsMs = now
+                            val shutterNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return
+                            val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
+                            val aperture = result.get(CaptureResult.LENS_APERTURE) ?: return
+                            _cameraParams.value = CameraParams(shutterNs, iso, aperture)
+                        }
+                    }
+                )
+                val preview = previewBuilder.build()
                     .also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
                 // Cap capture resolution at 4096px on the long edge.
@@ -407,6 +442,11 @@ class CameraManager @Inject constructor(
     }
 
     // ── Histogram ─────────────────────────────────────────────────────────────
+
+    fun setCameraParamsEnabled(enabled: Boolean) {
+        cameraParamsEnabled = enabled
+        if (!enabled) _cameraParams.value = null
+    }
 
     fun setHistogramEnabled(enabled: Boolean) {
         histogramEnabled = enabled
