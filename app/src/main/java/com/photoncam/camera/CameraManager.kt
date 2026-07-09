@@ -436,8 +436,13 @@ class CameraManager @Inject constructor(
     }
 
     private fun createOutputFile(): File {
-        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val dir = File(context.cacheDir, "captures").apply { mkdirs() }
+        // Millisecond precision so two shots in the same second get distinct filenames
+        // (the filename also keys the unique processing work + its params sidecar).
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        // Persistent internal storage (filesDir), NOT cacheDir: the processing worker
+        // runs deferred and must still find this RAW after the app is backgrounded/killed.
+        // cacheDir is OS-evictable under storage pressure and would vanish before the worker runs.
+        val dir = File(context.filesDir, "captures").apply { mkdirs() }
         return File(dir, "RAW_$ts.jpg")
     }
 
@@ -502,6 +507,10 @@ class CameraManager @Inject constructor(
 
     fun shutdown() {
         orientationListener.disable()
-        cameraExecutor.shutdown()
+        // Do NOT shut down cameraExecutor here: CameraManager is a @Singleton (process-lifetime)
+        // but shutdown() is called from ViewModel.onCleared() (screen-lifetime). Terminating the
+        // executor kills it for the whole process, so the next capture in the same process has its
+        // CameraX result dispatched to a dead executor → RejectedExecutionException → crash. The
+        // single-thread executor lives with the singleton; the OS reclaims it on process death.
     }
 }

@@ -12,9 +12,15 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.asFlow
 import androidx.lifecycle.viewModelScope
+import androidx.work.BackoffPolicy
+import androidx.work.Data
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
+import androidx.work.WorkRequest
 import androidx.work.workDataOf
 import androidx.camera.core.MeteringPointFactory
 import com.photoncam.camera.CameraManager
@@ -27,6 +33,7 @@ import com.photoncam.processing.DateImprintFont
 import com.photoncam.processing.DateImprintPosition
 import com.photoncam.processing.DateImprintSize
 import com.photoncam.processing.DateImprintStyle
+import com.photoncam.processing.LutProcessor
 import com.photoncam.processing.PhotoProcessingWorker
 import com.photoncam.utils.AppSettings
 import com.photoncam.utils.GalleryExporter
@@ -43,7 +50,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 
 enum class GridMode(val label: String) {
@@ -100,6 +109,11 @@ data class ViewfinderUiState(
     val gridMode: GridMode = GridMode.OFF,
 )
 
+// Processed JPEGs live in cache/processed only for the duration of a single doWork()
+// (write → save to gallery → delete). Any file older than this is an orphan — either from
+// an older app version that never cleaned up, or an interrupted run. Safe to sweep on launch.
+private const val STALE_PROCESSED_TTL_MS = 60 * 60 * 1000L // 1 hour
+
 @HiltViewModel
 class ViewfinderViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -107,6 +121,7 @@ class ViewfinderViewModel @Inject constructor(
     private val workManager: WorkManager,
     private val galleryExporter: GalleryExporter,
     private val settingsRepository: SettingsRepository,
+    private val lutProcessor: LutProcessor,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(ViewfinderUiState())
@@ -136,6 +151,12 @@ class ViewfinderViewModel @Inject constructor(
 
     // Track work IDs we've already reported to the UI to avoid duplicate updates.
     private val reportedWorkIds = mutableSetOf<UUID>()
+
+    // On the first work-info emission we seed reportedWorkIds with all already-terminal
+    // work so historical FAILED/SUCCEEDED records (persisted by WorkManager across restarts)
+    // are never re-surfaced on launch. Only work that transitions to terminal *after* startup
+    // is reported. Prevents the phantom "Processing failed" snackbar on every app launch.
+    private var workHistorySeeded = false
 
     init {
         viewModelScope.launch {
@@ -167,6 +188,8 @@ class ViewfinderViewModel @Inject constructor(
                     gridMode = runCatching { GridMode.valueOf(saved.gridMode) }.getOrDefault(GridMode.OFF),
                 )
             }
+            // Warm the LUT cache for the restored film so the first shot isn't slow.
+            preloadLut(_uiState.value.selectedFilm)
             // Re-apply histogram enable state in case bindCamera() already ran
             cameraManager.setHistogramEnabled(saved.histogramEnabled)
             cameraManager.setCameraParamsEnabled(saved.cameraParamsEnabled)
@@ -199,12 +222,60 @@ class ViewfinderViewModel @Inject constructor(
             if (uri != null) _uiState.update { it.copy(latestGalleryUri = uri) }
         }
 
+        // Housekeeping: sweep orphaned processed JPEGs left in cache by older app versions
+        // (which never deleted them). Only files older than the TTL are removed, so a
+        // currently-running worker's freshly written file is never touched.
+        viewModelScope.launch(Dispatchers.IO) {
+            val processedDir = File(context.cacheDir, "processed")
+            val cutoff = System.currentTimeMillis() - STALE_PROCESSED_TTL_MS
+            processedDir.listFiles()?.forEach { f ->
+                if (f.isFile && f.lastModified() < cutoff) f.delete()
+            }
+        }
+
+        // Recover orphaned captures: any RAW still in filesDir/captures was never processed to
+        // completion (the worker deletes the RAW on every terminal outcome). This happens if the
+        // app was hard-killed (force-stop / task-killer / crash) mid-processing. Re-enqueue each
+        // with REPLACE so processing resumes even if a stale work record is stuck; params come
+        // from the sidecar written at capture time. RAWs without a sidecar can't be faithfully
+        // reprocessed (pre-feature or corrupt) — delete them so they don't linger forever.
+        viewModelScope.launch(Dispatchers.IO) {
+            val capturesDir = File(context.filesDir, "captures")
+            capturesDir.listFiles()?.forEach { raw ->
+                if (!raw.isFile || !raw.name.startsWith("RAW_") || !raw.name.endsWith(".jpg")) return@forEach
+                val input = PhotoProcessingWorker.readSidecar(raw)
+                if (input == null) {
+                    raw.delete()
+                    return@forEach
+                }
+                workManager.enqueueUniqueWork(
+                    "proc_${raw.name}",
+                    ExistingWorkPolicy.REPLACE,
+                    buildProcessingRequest(input),
+                )
+            }
+        }
+
+        // Physically delete finished (SUCCEEDED/FAILED/CANCELLED) work records so the
+        // WorkManager DB doesn't grow unboundedly and stale failures stop accumulating.
+        // Leaves ENQUEUED/RUNNING work intact.
+        workManager.pruneWork()
+
         // Observe all PhotonCam processing work: update processingCount and surface
         // completed URIs. Uses LiveData.asFlow() so it works on all API levels.
         viewModelScope.launch {
             workManager.getWorkInfosByTagLiveData(PhotoProcessingWorker.WORK_TAG)
                 .asFlow()
                 .collect { workInfos ->
+                    // Seed dedup with pre-existing terminal work on the first emission so
+                    // historical failures/successes never surface on launch. init runs before
+                    // any user capture, so emission #1 reflects only the persisted DB.
+                    if (!workHistorySeeded) {
+                        workHistorySeeded = true
+                        workInfos.filter { it.state.isFinished }
+                            .forEach { reportedWorkIds.add(it.id) }
+                    }
+
                     val active = workInfos.count {
                         it.state == WorkInfo.State.RUNNING || it.state == WorkInfo.State.ENQUEUED
                     }
@@ -492,6 +563,13 @@ class ViewfinderViewModel @Inject constructor(
     fun selectFilm(film: FilmStock) {
         _uiState.update { it.copy(selectedFilm = film, showFilmSelector = false) }
         persistSettings()
+        // Warm the LUT cache now so the next shot doesn't pay the decode on the critical path.
+        preloadLut(film)
+    }
+
+    private fun preloadLut(film: FilmStock) {
+        val resId = film.lutResId ?: return
+        viewModelScope.launch { lutProcessor.preload(resId) }
     }
 
     fun toggleFilmSelector() {
@@ -601,6 +679,19 @@ class ViewfinderViewModel @Inject constructor(
         _uiState.update { it.copy(lastCapturedUri = null) }
     }
 
+    /** Builds the processing work request (expedited + exponential backoff) from the given input. */
+    private fun buildProcessingRequest(input: Data): OneTimeWorkRequest =
+        OneTimeWorkRequestBuilder<PhotoProcessingWorker>()
+            .addTag(PhotoProcessingWorker.WORK_TAG)
+            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            .setBackoffCriteria(
+                BackoffPolicy.EXPONENTIAL,
+                WorkRequest.MIN_BACKOFF_MILLIS,
+                TimeUnit.MILLISECONDS,
+            )
+            .setInputData(input)
+            .build()
+
     @OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
     fun capture() {
         val state = _uiState.value
@@ -649,27 +740,29 @@ class ViewfinderViewModel @Inject constructor(
                     persistSettings()
 
                     // Enqueue processing as a WorkManager task so it survives app close.
-                    val request = OneTimeWorkRequestBuilder<PhotoProcessingWorker>()
-                        .addTag(PhotoProcessingWorker.WORK_TAG)
-                        .setInputData(
-                            workDataOf(
-                                PhotoProcessingWorker.KEY_RAW_FILE_PATH to rawFile.absolutePath,
-                                PhotoProcessingWorker.KEY_FILM_ID to film.id,
-                                PhotoProcessingWorker.KEY_DATE_IMPRINT_ENABLED to dateEnabled,
-                                PhotoProcessingWorker.KEY_DATE_STYLE to dateStyle.name,
-                                PhotoProcessingWorker.KEY_DATE_COLOR to dateColor.name,
-                                PhotoProcessingWorker.KEY_DATE_FONT to dateFont.name,
-                                PhotoProcessingWorker.KEY_DATE_SIZE to dateSize.name,
-                                PhotoProcessingWorker.KEY_DATE_POSITION to datePosition.name,
-                                PhotoProcessingWorker.KEY_DATE_GLOW to dateGlow,
-                                PhotoProcessingWorker.KEY_DATE_BLUR to dateBlur,
-                                PhotoProcessingWorker.KEY_DATE_OPACITY to dateOpacity,
-                                PhotoProcessingWorker.KEY_DATE_BLUR_REPEAT to dateBlurRepeat,
-                                PhotoProcessingWorker.KEY_LIGHT_LEAK_ENABLED to lightLeak,
-                            )
-                        )
-                        .build()
-                    workManager.enqueue(request)
+                    val inputData = workDataOf(
+                        PhotoProcessingWorker.KEY_RAW_FILE_PATH to rawFile.absolutePath,
+                        PhotoProcessingWorker.KEY_FILM_ID to film.id,
+                        PhotoProcessingWorker.KEY_DATE_IMPRINT_ENABLED to dateEnabled,
+                        PhotoProcessingWorker.KEY_DATE_STYLE to dateStyle.name,
+                        PhotoProcessingWorker.KEY_DATE_COLOR to dateColor.name,
+                        PhotoProcessingWorker.KEY_DATE_FONT to dateFont.name,
+                        PhotoProcessingWorker.KEY_DATE_SIZE to dateSize.name,
+                        PhotoProcessingWorker.KEY_DATE_POSITION to datePosition.name,
+                        PhotoProcessingWorker.KEY_DATE_GLOW to dateGlow,
+                        PhotoProcessingWorker.KEY_DATE_BLUR to dateBlur,
+                        PhotoProcessingWorker.KEY_DATE_OPACITY to dateOpacity,
+                        PhotoProcessingWorker.KEY_DATE_BLUR_REPEAT to dateBlurRepeat,
+                        PhotoProcessingWorker.KEY_LIGHT_LEAK_ENABLED to lightLeak,
+                    )
+                    // Persist params next to the RAW so an orphaned capture (app hard-killed
+                    // mid-processing) can be faithfully reprocessed on next launch.
+                    PhotoProcessingWorker.writeSidecar(rawFile, inputData)
+                    workManager.enqueueUniqueWork(
+                        "proc_${rawFile.name}",
+                        ExistingWorkPolicy.KEEP,
+                        buildProcessingRequest(inputData),
+                    )
                 }
                 .onFailure { e ->
                     if (useScreenFlash) {

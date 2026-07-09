@@ -8,6 +8,8 @@ import android.graphics.Rect
 import android.util.LruCache
 import androidx.annotation.RawRes
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -35,10 +37,21 @@ class LutProcessor @Inject constructor(
      */
     private val cache = LruCache<Int, FloatArray>(3)
 
-    fun applyLut(bitmap: Bitmap, @RawRes lutResId: Int): Bitmap {
+    suspend fun applyLut(bitmap: Bitmap, @RawRes lutResId: Int): Bitmap {
         val lut = cache[lutResId] ?: loadLut(lutResId).also { cache.put(lutResId, it) }
         val size = Math.cbrt(lut.size / 3.0).toInt()
         return applyLutToBitmap(bitmap, lut, size)
+    }
+
+    /**
+     * Loads and caches a LUT ahead of processing (e.g. when a film is selected), so the first
+     * photo doesn't pay the one-time HaldCLUT decode — several seconds for large level-16 CLUTs.
+     * No-op if already cached. Runs off the caller's thread on [Dispatchers.Default].
+     */
+    suspend fun preload(@RawRes lutResId: Int): Unit = withContext(Dispatchers.Default) {
+        if (cache[lutResId] == null) {
+            runCatching { loadLut(lutResId) }.getOrNull()?.let { cache.put(lutResId, it) }
+        }
     }
 
     private fun loadLut(@RawRes resId: Int): FloatArray {
@@ -209,67 +222,55 @@ class LutProcessor @Inject constructor(
         return values.toFloatArray()
     }
 
-    private fun applyLutToBitmap(bitmap: Bitmap, lut: FloatArray, size: Int): Bitmap {
+    private suspend fun applyLutToBitmap(bitmap: Bitmap, lut: FloatArray, size: Int): Bitmap {
         val width = bitmap.width
         val height = bitmap.height
         val pixels = IntArray(width * height)
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
 
         val scale = (size - 1).toFloat()
+        val size3 = size * 3               // stride for gi+1
+        val plane3 = size * size * 3       // stride for bi+1
 
-        for (i in pixels.indices) {
-            val pixel = pixels[i]
-            val r = ((pixel shr 16) and 0xFF) / 255f
-            val g = ((pixel shr 8) and 0xFF) / 255f
-            val b = (pixel and 0xFF) / 255f
+        // Trilinear interpolation, inlined per channel — no per-pixel object allocation
+        // (the old Triple return allocated ~12M objects per image), parallelized across cores.
+        forEachChunk(pixels.size) { start, end ->
+            for (i in start until end) {
+                val pixel = pixels[i]
+                val rs = ((pixel shr 16) and 0xFF) / 255f * scale
+                val gs = ((pixel shr 8) and 0xFF) / 255f * scale
+                val bs = (pixel and 0xFF) / 255f * scale
 
-            // Trilinear interpolation
-            val ri = (r * scale).toInt().coerceIn(0, size - 2)
-            val gi = (g * scale).toInt().coerceIn(0, size - 2)
-            val bi = (b * scale).toInt().coerceIn(0, size - 2)
+                val ri = rs.toInt().coerceIn(0, size - 2)
+                val gi = gs.toInt().coerceIn(0, size - 2)
+                val bi = bs.toInt().coerceIn(0, size - 2)
+                val rf = rs - ri
+                val gf = gs - gi
+                val bf = bs - bi
 
-            val rf = r * scale - ri
-            val gf = g * scale - gi
-            val bf = b * scale - bi
+                val c000 = (bi * size * size + gi * size + ri) * 3
+                val c100 = c000 + 3
+                val c010 = c000 + size3
+                val c110 = c010 + 3
+                val c001 = c000 + plane3
+                val c101 = c001 + 3
+                val c011 = c001 + size3
+                val c111 = c011 + 3
 
-            val (nr, ng, nb) = trilinear(lut, size, ri, gi, bi, rf, gf, bf)
-
-            pixels[i] = (pixel and 0xFF000000.toInt()) or
-                ((nr * 255).toInt().coerceIn(0, 255) shl 16) or
-                ((ng * 255).toInt().coerceIn(0, 255) shl 8) or
-                (nb * 255).toInt().coerceIn(0, 255)
+                var out = 0
+                for (off in 0..2) {
+                    val v0 = lerp(lerp(lut[c000 + off], lut[c100 + off], rf), lerp(lut[c010 + off], lut[c110 + off], rf), gf)
+                    val v1 = lerp(lerp(lut[c001 + off], lut[c101 + off], rf), lerp(lut[c011 + off], lut[c111 + off], rf), gf)
+                    val v = (lerp(v0, v1, bf) * 255f).toInt().coerceIn(0, 255)
+                    out = out or (v shl ((2 - off) * 8))
+                }
+                pixels[i] = (pixel and 0xFF000000.toInt()) or out
+            }
         }
 
         // Write modified pixels back onto the (already mutable) source bitmap.
         // This avoids allocating a second full-resolution copy alongside the pixels array.
         bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
         return bitmap
-    }
-
-    private fun trilinear(
-        lut: FloatArray,
-        size: Int,
-        ri: Int, gi: Int, bi: Int,
-        rf: Float, gf: Float, bf: Float,
-    ): Triple<Float, Float, Float> {
-        fun idx(r: Int, g: Int, b: Int) = (b * size * size + g * size + r) * 3
-
-        val c000 = idx(ri, gi, bi)
-        val c100 = idx(ri + 1, gi, bi)
-        val c010 = idx(ri, gi + 1, bi)
-        val c110 = idx(ri + 1, gi + 1, bi)
-        val c001 = idx(ri, gi, bi + 1)
-        val c101 = idx(ri + 1, gi, bi + 1)
-        val c011 = idx(ri, gi + 1, bi + 1)
-        val c111 = idx(ri + 1, gi + 1, bi + 1)
-
-        fun lerp(a: Float, b: Float, t: Float) = a + (b - a) * t
-        fun channel(off: Int): Float {
-            val v0 = lerp(lerp(lut[c000 + off], lut[c100 + off], rf), lerp(lut[c010 + off], lut[c110 + off], rf), gf)
-            val v1 = lerp(lerp(lut[c001 + off], lut[c101 + off], rf), lerp(lut[c011 + off], lut[c111 + off], rf), gf)
-            return lerp(v0, v1, bf)
-        }
-
-        return Triple(channel(0), channel(1), channel(2))
     }
 }

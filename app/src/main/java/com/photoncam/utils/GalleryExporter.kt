@@ -12,6 +12,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -42,17 +43,26 @@ class GalleryExporter @Inject constructor(
 
                 val resolver = context.contentResolver
                 val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-                    ?: error("MediaStore insert returned null")
+                    ?: throw IOException("MediaStore insert returned null")
 
-                resolver.openOutputStream(uri)?.use { out ->
-                    file.inputStream().use { it.copyTo(out) }
+                try {
+                    // A null stream must be a hard failure — silently skipping the write
+                    // would leave a 0-byte entry counted as a successful save.
+                    val out = resolver.openOutputStream(uri)
+                        ?: throw IOException("openOutputStream returned null for $uri")
+                    out.use { file.inputStream().use { input -> input.copyTo(it) } }
+
+                    contentValues.clear()
+                    contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
+                    resolver.update(uri, contentValues, null, null)
+
+                    uri
+                } catch (t: Throwable) {
+                    // Remove the half-written pending row so it doesn't linger invisibly
+                    // (IS_PENDING=1) in the gallery, then rethrow → outer runCatching → failure.
+                    runCatching { resolver.delete(uri, null, null) }
+                    throw t
                 }
-
-                contentValues.clear()
-                contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
-                resolver.update(uri, contentValues, null, null)
-
-                uri
             } else {
                 @Suppress("DEPRECATION")
                 val picturesDir = File(

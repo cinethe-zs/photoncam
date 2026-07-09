@@ -78,11 +78,9 @@ class ImageProcessor @Inject constructor(
                 film.lutResId?.let { resId -> lutProcessor.applyLut(bitmap, resId) } ?: bitmap
             }
 
-            // 3. Per-film color grade: saturation + contrast + shadow lift (in-place)
-            applyColorGrade(bitmap, film.saturation, film.contrast, film.shadowLift)
-
-            // 4. Highlight rolloff curve (in-place)
-            applyHighlightRolloff(bitmap, film.highlightRolloff)
+            // 3+4. Per-film grade (contrast + shadow lift + saturation) then highlight
+            //      rolloff, fused into one parallel pass (single getPixels/setPixels).
+            applyGradeAndRolloff(bitmap, film.saturation, film.contrast, film.shadowLift, film.highlightRolloff)
 
             // 5. Grain (in-place)
             bitmap = grainProcessor.applyGrain(bitmap, film.grainAmount, film.grainSize)
@@ -171,12 +169,21 @@ class ImageProcessor @Inject constructor(
     }
 
     /**
-     * Per-film color grade applied in-place on the pixel array.
-     * Order: contrast → shadow lift → saturation.
-     * Equivalent to the previous ColorMatrix approach but without allocating a second bitmap.
+     * Fused per-film grade + highlight rolloff, applied in-place across cores in a single
+     * getPixels/setPixels pass. Order matches the previous two separate passes exactly
+     * (contrast → shadow lift → saturation, clamped to 0..255, then rolloff), so the output
+     * is bit-for-bit identical — this only removes redundant memory traffic and parallelizes.
      */
-    private fun applyColorGrade(bitmap: Bitmap, saturation: Float, contrast: Float, shadowLift: Float) {
-        if (saturation == 1f && contrast == 1f && shadowLift == 0f) return
+    private suspend fun applyGradeAndRolloff(
+        bitmap: Bitmap,
+        saturation: Float,
+        contrast: Float,
+        shadowLift: Float,
+        rolloff: Float,
+    ) {
+        val gradeNeutral = saturation == 1f && contrast == 1f && shadowLift == 0f
+        val rolloffNeutral = rolloff == 0f
+        if (gradeNeutral && rolloffNeutral) return
 
         val width = bitmap.width
         val height = bitmap.height
@@ -190,49 +197,37 @@ class ImageProcessor @Inject constructor(
         val gW = invSat * 0.715f
         val bW = invSat * 0.072f
 
-        for (i in pixels.indices) {
-            val px = pixels[i]
-            var r = ((px shr 16) and 0xFF).toFloat()
-            var g = ((px shr 8)  and 0xFF).toFloat()
-            var b = ( px         and 0xFF).toFloat()
+        val s = rolloff.coerceIn(0f, 1f)
+        val rScale = 1f - s * 0.18f
+        val rLift = s * 14f
 
-            // Contrast + shadow lift
-            r = r * contrast + offset
-            g = g * contrast + offset
-            b = b * contrast + offset
+        forEachChunk(pixels.size) { start, end ->
+            for (i in start until end) {
+                val px = pixels[i]
+                var ri = (px shr 16) and 0xFF
+                var gi = (px shr 8) and 0xFF
+                var bi = px and 0xFF
 
-            // Saturation
-            val lum = rW * r + gW * g + bW * b
-            r = (lum + saturation * r).coerceIn(0f, 255f)
-            g = (lum + saturation * g).coerceIn(0f, 255f)
-            b = (lum + saturation * b).coerceIn(0f, 255f)
+                if (!gradeNeutral) {
+                    // Contrast + shadow lift
+                    val rc = ri * contrast + offset
+                    val gc = gi * contrast + offset
+                    val bc = bi * contrast + offset
+                    // Saturation
+                    val lum = rW * rc + gW * gc + bW * bc
+                    ri = (lum + saturation * rc).coerceIn(0f, 255f).toInt()
+                    gi = (lum + saturation * gc).coerceIn(0f, 255f).toInt()
+                    bi = (lum + saturation * bc).coerceIn(0f, 255f).toInt()
+                }
 
-            pixels[i] = (px and 0xFF000000.toInt()) or
-                (r.toInt() shl 16) or (g.toInt() shl 8) or b.toInt()
-        }
-        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
-    }
+                if (!rolloffNeutral) {
+                    ri = (ri * rScale + rLift).coerceIn(0f, 255f).toInt()
+                    gi = (gi * rScale + rLift).coerceIn(0f, 255f).toInt()
+                    bi = (bi * rScale + rLift).coerceIn(0f, 255f).toInt()
+                }
 
-    /**
-     * Highlight rolloff applied in-place: `out = in * scale + lift`.
-     */
-    private fun applyHighlightRolloff(bitmap: Bitmap, strength: Float) {
-        if (strength == 0f) return
-        val s = strength.coerceIn(0f, 1f)
-        val scale = 1f - s * 0.18f
-        val lift = s * 14f
-
-        val width = bitmap.width
-        val height = bitmap.height
-        val pixels = IntArray(width * height)
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-
-        for (i in pixels.indices) {
-            val px = pixels[i]
-            val r = ((((px shr 16) and 0xFF) * scale + lift).coerceIn(0f, 255f)).toInt()
-            val g = ((((px shr 8)  and 0xFF) * scale + lift).coerceIn(0f, 255f)).toInt()
-            val b = ((( px         and 0xFF) * scale + lift).coerceIn(0f, 255f)).toInt()
-            pixels[i] = (px and 0xFF000000.toInt()) or (r shl 16) or (g shl 8) or b
+                pixels[i] = (px and 0xFF000000.toInt()) or (ri shl 16) or (gi shl 8) or bi
+            }
         }
         bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
     }

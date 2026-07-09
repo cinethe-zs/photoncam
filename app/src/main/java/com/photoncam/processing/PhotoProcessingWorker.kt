@@ -8,6 +8,7 @@ import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.hilt.work.HiltWorker
 import androidx.work.CoroutineWorker
+import androidx.work.Data
 import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
@@ -16,6 +17,7 @@ import com.photoncam.utils.GalleryExporter
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import java.io.File
+import java.io.IOException
 
 /**
  * WorkManager worker that runs the full image processing pipeline.
@@ -84,9 +86,10 @@ class PhotoProcessingWorker @AssistedInject constructor(
         val lightLeak = inputData.getBoolean(KEY_LIGHT_LEAK_ENABLED, true)
 
         val rawFile = File(rawFilePath)
-        if (!rawFile.exists()) return Result.failure()
+        if (!rawFile.exists()) { sidecarFile(rawFile).delete(); return Result.failure() }
 
-        val film = FilmCatalog.findById(filmId) ?: return Result.failure()
+        val film = FilmCatalog.findById(filmId)
+            ?: run { rawFile.delete(); sidecarFile(rawFile).delete(); return Result.failure() }
 
         return imageProcessor.process(
             inputFile = rawFile,
@@ -107,12 +110,32 @@ class PhotoProcessingWorker @AssistedInject constructor(
                 galleryExporter.saveToGallery(processedFile).fold(
                     onSuccess = { uri ->
                         rawFile.delete()
+                        processedFile.delete()
+                        sidecarFile(rawFile).delete()
                         Result.success(workDataOf(KEY_GALLERY_URI to uri.toString()))
                     },
-                    onFailure = { Result.failure() },
+                    onFailure = { e ->
+                        // Transient IO/storage failure → retry (keep raw + processed + sidecar
+                        // so the next attempt can reuse them). Anything else is terminal.
+                        if (e is IOException && runAttemptCount < MAX_RETRIES) {
+                            Result.retry()
+                        } else {
+                            rawFile.delete(); processedFile.delete(); sidecarFile(rawFile).delete()
+                            Result.failure()
+                        }
+                    },
                 )
             },
-            onFailure = { Result.failure() },
+            onFailure = { e ->
+                // Transient IO during processing → retry (keep raw + sidecar for the next attempt).
+                // Decode errors / OOM / bad input are terminal.
+                if (e is IOException && runAttemptCount < MAX_RETRIES) {
+                    Result.retry()
+                } else {
+                    rawFile.delete(); sidecarFile(rawFile).delete()
+                    Result.failure()
+                }
+            },
         )
     }
 
@@ -134,5 +157,44 @@ class PhotoProcessingWorker @AssistedInject constructor(
         const val WORK_TAG = "photoncam_photo_processing"
         private const val CHANNEL_ID = "photoncam_processing"
         private const val NOTIFICATION_ID = 1001
+        private const val MAX_RETRIES = 2 // 3 attempts total before a transient failure becomes terminal
+
+        /** Params file written next to a RAW so an orphaned capture can be reprocessed faithfully. */
+        fun sidecarFile(rawFile: File): File = File(rawFile.parentFile, rawFile.name + ".params")
+
+        /** Serialize the work input [Data] to the sidecar as `key<TAB>type<TAB>value` lines. */
+        fun writeSidecar(rawFile: File, data: Data) {
+            runCatching {
+                val text = buildString {
+                    for ((k, v) in data.keyValueMap) {
+                        val (type, value) = when (v) {
+                            is Boolean -> "B" to v.toString()
+                            is Int -> "I" to v.toString()
+                            is Long -> "L" to v.toString()
+                            else -> "S" to v.toString()
+                        }
+                        append(k).append('\t').append(type).append('\t').append(value).append('\n')
+                    }
+                }
+                sidecarFile(rawFile).writeText(text)
+            }
+        }
+
+        /** Reconstruct the work input [Data] from a RAW's sidecar, or null if missing/corrupt. */
+        fun readSidecar(rawFile: File): Data? = runCatching {
+            val f = sidecarFile(rawFile)
+            if (!f.exists()) return null
+            val builder = Data.Builder()
+            f.readLines().forEach { line ->
+                val p = line.split('\t')
+                if (p.size == 3) when (p[1]) {
+                    "B" -> builder.putBoolean(p[0], p[2].toBoolean())
+                    "I" -> builder.putInt(p[0], p[2].toInt())
+                    "L" -> builder.putLong(p[0], p[2].toLong())
+                    else -> builder.putString(p[0], p[2])
+                }
+            }
+            builder.build()
+        }.getOrNull()
     }
 }
