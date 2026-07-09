@@ -8,6 +8,7 @@ An Android film camera emulator. Select a film stock, shoot through a vintage ra
 
 - **73 film stocks** across 8 brands — each with a unique 3D LUT, grain profile, and colour character
 - **Rangefinder UI** — physical camera body aesthetic with D-pad EV control, lens selector ring, and shutter button
+- **Live exposure readout** — optional viewfinder overlay showing real-time shutter speed, aperture, and ISO
 - **Flash** — hardware flash on back camera; screen flash (full white, max brightness) on front camera
 - **Grain & light leaks** — procedural per-shot analog artefacts
 - **Date imprint** — configurable 1990s-style timestamp: format, colour, font (LED 7-segment), size, position, glow, blur, opacity, layer repeat
@@ -156,7 +157,7 @@ Burns a configurable 1990s-style timestamp into each photo — applied to raw pi
 ## Build
 
 ```bash
-./gradlew assembleDebug    # → app/build/outputs/apk/debug/photoncam-v1.3.0.apk
+./gradlew assembleDebug    # → app/build/outputs/apk/debug/photoncam-v1.4.0.apk
 ./gradlew installDebug     # install on device / emulator
 ```
 
